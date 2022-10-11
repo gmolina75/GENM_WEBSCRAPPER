@@ -3,4 +3,4 @@ Sri WebScrapper
 
 RPA para Automatizacion robotica del procesos de descarga de docunentos que me han facturado como contribuyente
 
-Este se ofrece como una ejeccio practico solamente sin ninguna Garantia
+Este se ofrece como una ejercicio practico solamente sin ninguna Garantia
