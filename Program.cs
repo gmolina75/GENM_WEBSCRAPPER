@@ -120,7 +120,7 @@ namespace GENM_WEBSCRAPPER
                     //IJavaScriptExecutor js = (IJavaScriptExecutor)driver;
                     //string title = (string)js.ExecuteScript("return document.title");
                     driver.Navigate().GoToUrl("https://srienlinea.sri.gob.ec/auth/realms/Internet/protocol/openid-connect/auth?client_id=app-sri-claves-angular&redirect_uri=https%3A%2F%2Fsrienlinea.sri.gob.ec%2Fsri-en-linea%2F%2Fcontribuyente%2Fperfil&state=374db854-f421-4851-8cd9-b0236febb938&nonce=5759ba4d-b6ee-401d-86ae-74c266c7ca36&response_mode=fragment&response_type=code&scope=openid");
-                    Console.WriteLine("paso  pagina sri");
+                    Console.WriteLine("paso 0 pagina sri");
                     var userNameField = driver.FindElement(By.Id("usuario"));
                     var userPasswordField = driver.FindElement(By.Id("password"));
                     var loginButton = driver.FindElement(By.XPath("//input[@value='Ingresar']"));
@@ -147,7 +147,16 @@ namespace GENM_WEBSCRAPPER
                     consultarButton.Click();
                     Console.WriteLine("paso 4 click en consultar documentos");
                     Thread.Sleep(10000);
-                    driver.GetScreenshot().SaveAsFile(@"z:\\screen4.png", ScreenshotImageFormat.Png);
+                    try
+                    {
+                        driver.GetScreenshot().SaveAsFile(@"z:\\screen4.png");
+                    }
+                    catch (Exception)
+                    {
+
+                       
+                    }
+                    
                     ////
                     //String framename= driver.FindElement(By.TagName("iframe")).GetAttribute("name");
                     //driver.SwitchTo().Frame(framename);
