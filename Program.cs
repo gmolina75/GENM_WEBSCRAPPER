@@ -3,10 +3,13 @@ using OpenQA.Selenium.Chrome;
 using OpenQA.Selenium.Support.UI;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using Microsoft.Win32;
 using Newtonsoft.Json;
@@ -15,31 +18,67 @@ namespace GENM_WEBSCRAPPER
 {
     class Program
     {
-        private const string SriLoginUrl = "https://srienlinea.sri.gob.ec/auth/realms/Internet/protocol/openid-connect/auth?client_id=app-sri-claves-angular&redirect_uri=https%3A%2F%2Fsrienlinea.sri.gob.ec%2Fsri-en-linea%2F%2Fcontribuyente%2Fperfil&state=374db854-f421-4851-8cd9-b0236febb938&nonce=5759ba4d-b6ee-401d-86ae-74c266c7ca36&response_mode=fragment&response_type=code&scope=openid";
-        private const string SriReceivedDocsUrl = "https://srienlinea.sri.gob.ec/tuportal-internet/accederAplicacion.jspa?redireccion=57&idGrupo=55";
+        private const string SriLoginUrl =
+            "https://srienlinea.sri.gob.ec/auth/realms/Internet/protocol/openid-connect/auth" +
+            "?client_id=app-sri-claves-angular" +
+            "&redirect_uri=https%3A%2F%2Fsrienlinea.sri.gob.ec%2Fsri-en-linea%2F%2Fcontribuyente%2Fperfil" +
+            "&state=374db854-f421-4851-8cd9-b0236febb938&nonce=5759ba4d-b6ee-401d-86ae-74c266c7ca36" +
+            "&response_mode=fragment&response_type=code&scope=openid";
 
-        /// <summary>
-        /// Argumentos esperados:
-        /// 0: RUC (usuario del SRI)
-        /// 1: Contraseña del SRI
-        /// 2: Fecha desde (yyyy-MM-dd) o vacío
-        /// 3: Fecha hasta (yyyy-MM-dd) o vacío
-        /// 4: Tipo de comprobante (01, 03, 04, 05, 07) o vacío para todos
-        /// 5: URL destino para subir archivos (ej. https://host/u/1.ashx)
-        /// 6: Token para el endpoint destino
-        /// 7: Directorio de trabajo temporal (opcional, default %TEMP%\SriReceived)
-        /// 8: Guardar conexión cifrada (S/N, opcional)
-        /// </summary>
-        static void Main(string[] args)
+        private const string SriReceivedDocsUrl =
+            "https://srienlinea.sri.gob.ec/tuportal-internet/accederAplicacion.jspa?redireccion=57&idGrupo=55";
+
+        private static readonly string[] SupportedDocumentTypes = { "01", "03", "04", "05", "07" };
+
+        private static class SriSelectors
+        {
+            public const string LoginInput = "usuario";
+            public const string PasswordInput = "password";
+            public const string LoginButtonXPath = "//input[@value='Ingresar']";
+            public const string DayDropdownId = "frmPrincipal:dia";
+            public const string DocumentTypeDropdownId = "frmPrincipal:cmbTipoComprobante";
+            public const string DateFromInputId = "frmPrincipal:fechaDesde";
+            public const string DateToInputId = "frmPrincipal:fechaHasta";
+            public const string ConsultButtonId = "frmPrincipal:btnConsultarSinRe";
+            public const string GridXPath = "//*[@role='grid']";
+            public const int ColumnAccessKey = 3;
+            public const int ColumnXml = 9;
+            public const int ColumnPdf = 10;
+            public const int MinCells = 11;
+        }
+        static int Main(string[] args)
         {
             Console.WriteLine(
-                $"GENM_WEBSCRAPPER | Versión {BuildInfo.Version} | " +
+                $"GENM_WEBSCRAPPER | VersiÃ³n {BuildInfo.Version} | " +
                 $"Compilado: {BuildInfo.CompiledAt}");
+
+            if (ContainsFlag(args, "--help") || ContainsFlag(args, "-h") || ContainsFlag(args, "/?"))
+            {
+                PrintUsage();
+                return 0;
+            }
+            if (ContainsFlag(args, "--version") || ContainsFlag(args, "-v"))
+            {
+                Console.WriteLine($"GENM_WEBSCRAPPER v{BuildInfo.Version}");
+                return 0;
+            }
+
             var parameters = ParseArguments(args);
             if (parameters == null)
             {
                 PrintUsage();
-                return;
+                return 1;
+            }
+
+            if (string.IsNullOrWhiteSpace(parameters.Ruc))
+            {
+                Console.WriteLine("ERROR: El RUC es obligatorio.");
+                return 1;
+            }
+            if (string.IsNullOrWhiteSpace(parameters.Password))
+            {
+                Console.WriteLine("ERROR: La contraseÃ±a es obligatoria.");
+                return 1;
             }
 
             if (parameters.SaveConnection)
@@ -47,20 +86,18 @@ namespace GENM_WEBSCRAPPER
                 try
                 {
                     SaveConnectionData(parameters);
-                    Console.WriteLine("Datos de conexión guardados de forma cifrada para este usuario y esta máquina.");
+                    Console.WriteLine("Datos de conexiÃ³n guardados de forma cifrada para este usuario y esta mÃ¡quina.");
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine("No se pudieron guardar los datos de conexión cifrados: " + ex.Message);
+                    Console.WriteLine("No se pudieron guardar los datos de conexiÃ³n cifrados: " + ex.Message);
                 }
             }
-
             EnsureDirectory(parameters.DownloadDirectory);
             string logFile = Path.Combine(parameters.DownloadDirectory, "GENM_WEBSCRAPPER.log");
             var logger = new SimpleLogger(logFile);
-            logger.WriteLine(
-                "Registros JSON por fila: <directorio>\\<código-tipo>\\<clave>.json");
 
+            logger.WriteLine("Registros JSON por fila: <directorio>\\<cÃ³digo-tipo>\\<clave>.json");
             logger.WriteLine("======================================================");
             logger.WriteLine("Descarga de comprobantes recibidos del SRI");
             logger.WriteLine($"RUC: {parameters.Ruc}");
@@ -69,6 +106,7 @@ namespace GENM_WEBSCRAPPER
             logger.WriteLine($"Tipo: {parameters.DocumentType ?? "(todos)"}");
             logger.WriteLine($"Destino: {parameters.UploadUrl}");
             logger.WriteLine($"Directorio temporal: {parameters.DownloadDirectory}");
+            logger.WriteLine($"Chrome visible: {parameters.Visible}");
             logger.WriteLine("======================================================");
 
             int uploadedXmlCount = 0;
@@ -82,69 +120,44 @@ namespace GENM_WEBSCRAPPER
             try
             {
                 var chromeOptions = new ChromeOptions();
-                // Continuar cuando el DOM esté disponible sin esperar imágenes,
-                // analítica u otros recursos lentos del portal.
-                chromeOptions.PageLoadStrategy = PageLoadStrategy.Eager;
+                chromeOptions.AddArguments("--disable-gpu");
+                chromeOptions.AddArguments("--no-sandbox");
 
-                // Modo visible util para diagnostico. Activar con variable de entorno SRI_VISIBLE=1.
-                string visibleEnv = Environment.GetEnvironmentVariable("SRI_VISIBLE");
-                bool visibleMode = !string.IsNullOrWhiteSpace(visibleEnv) &&
-                                   (visibleEnv.Trim() == "1" || visibleEnv.Trim().Equals("true", StringComparison.OrdinalIgnoreCase));
-
-                if (!visibleMode)
+                if (parameters.Visible)
                 {
-                    chromeOptions.AddArguments("--headless");
                 }
                 else
                 {
-                    chromeOptions.AddArguments("start-maximized");
-                    logger.WriteLine("Modo visible activado (SRI_VISIBLE).");
+                    chromeOptions.AddArguments("--headless=new");
                 }
 
-                // Opciones de estabilidad recomendadas para entornos sin interfaz y servidores.
-                chromeOptions.AddArguments("--no-sandbox");
-                chromeOptions.AddArguments("--disable-dev-shm-usage");
-                chromeOptions.AddArguments("--disable-gpu");
-                chromeOptions.AddArguments("--disable-extensions");
-                chromeOptions.AddArguments("--disable-software-rasterizer");
-                chromeOptions.AddArguments("--remote-debugging-port=0");
-                chromeOptions.AddArguments("--allow-running-insecure-content");
-
-                // Permitir especificar la ruta de Chrome si no esta en el PATH o no se detecta.
-                string chromePath = Environment.GetEnvironmentVariable("SRI_CHROME_PATH");
-                if (!string.IsNullOrWhiteSpace(chromePath) && File.Exists(chromePath))
+                if (!string.IsNullOrWhiteSpace(parameters.ChromePath))
                 {
-                    chromeOptions.BinaryLocation = chromePath;
-                    logger.WriteLine($"Usando Chrome desde: {chromePath}");
+                    chromeOptions.BinaryLocation = parameters.ChromePath;
                 }
 
                 chromeOptions.AddUserProfilePreference("download.default_directory", parameters.DownloadDirectory);
                 chromeOptions.AddUserProfilePreference("download.prompt_for_download", false);
                 chromeOptions.AddUserProfilePreference("download.directory_upgrade", true);
-                chromeOptions.AddUserProfilePreference("profile.default_content_setting_values.automatic_downloads", 1);
-                chromeOptions.AddUserProfilePreference("profile.default_content_setting_values.insecure_content", 1);
                 chromeOptions.AddUserProfilePreference("safebrowsing.enabled", true);
 
-                logger.WriteLine("Iniciando ChromeDriver...");
-                driver = new ChromeDriver(
-                    AppDomain.CurrentDomain.BaseDirectory, chromeOptions,
-                    TimeSpan.FromMinutes(3));
+                var service = ChromeDriverService.CreateDefaultService(AppDomain.CurrentDomain.BaseDirectory);
+                driver = new ChromeDriver(service, chromeOptions, TimeSpan.FromMinutes(3));
                 driver.Manage().Timeouts().PageLoad = TimeSpan.FromMinutes(2);
+
                 driver.ExecuteCdpCommand("Page.setDownloadBehavior", new Dictionary<string, object>
                 {
                     { "behavior", "allow" },
                     { "downloadPath", parameters.DownloadDirectory }
                 });
-
-                // 1. Login
                 logger.WriteLine("Navegando al login del SRI...");
                 driver.Navigate().GoToUrl(SriLoginUrl);
                 new WebDriverWait(driver, TimeSpan.FromSeconds(15)).Until(
-                    d => FindElementSafe(d, By.Id("usuario")) != null);
+                    d => FindElementSafe(d, By.Id(SriSelectors.LoginInput)) != null);
 
-                var userNameField = FindElementSafe(driver, By.Id("usuario"));
-                var userPasswordField = FindElementSafe(driver, By.Id("password"));
-                var loginButton = FindElementSafe(driver, By.XPath("//input[@value='Ingresar']"));
+                var userNameField = FindElementSafe(driver, By.Id(SriSelectors.LoginInput));
+                var userPasswordField = FindElementSafe(driver, By.Id(SriSelectors.PasswordInput));
+                var loginButton = FindElementSafe(driver, By.XPath(SriSelectors.LoginButtonXPath));
 
                 if (userNameField == null || userPasswordField == null || loginButton == null)
                 {
@@ -157,225 +170,296 @@ namespace GENM_WEBSCRAPPER
                 userPasswordField.SendKeys(parameters.Password);
                 loginButton.Click();
                 logger.WriteLine("Credenciales enviadas.");
+
                 WaitForLogin(driver, logger, TimeSpan.FromMinutes(3));
 
-                // 2. Ir a comprobantes recibidos solo después de confirmar el login.
-                logger.WriteLine("Abriendo sección de comprobantes recibidos...");
+                logger.WriteLine("Abriendo secciÃ³n de comprobantes recibidos...");
                 driver.Navigate().GoToUrl(SriReceivedDocsUrl);
                 new WebDriverWait(driver, TimeSpan.FromSeconds(30)).Until(
                     d => ((IJavaScriptExecutor)d).ExecuteScript("return document.readyState")?.ToString() == "complete");
-                Thread.Sleep(2000);
 
-                // 3. Aplicar filtros si se proporcionaron (con manejo de errores)
+                new WebDriverWait(driver, TimeSpan.FromSeconds(10)).Until(
+                    d => FindElementSafe(d, By.Id(SriSelectors.DayDropdownId)) != null);
+
                 ApplyFilters(driver, parameters, logger);
-
                 string[] typesToQuery = string.IsNullOrWhiteSpace(parameters.DocumentType)
-                    ? new[] { "01", "03", "04", "05", "07" }
+                    ? SupportedDocumentTypes
                     : new[] { parameters.DocumentType };
+
                 foreach (string queryType in typesToQuery)
                 {
-                if (!SelectDocumentType(driver, queryType, logger))
-                    continue;
-
-                // 4. Consultar cada tipo por separado.
-                IWebElement consultarButton = null;
-                try
-                {
-                    consultarButton = new WebDriverWait(driver, TimeSpan.FromSeconds(30)).Until(
-                        d => FindElementSafe(d, By.Id("frmPrincipal:btnConsultarSinRe")));
-                }
-                catch (WebDriverTimeoutException)
-                {
-                }
-                if (consultarButton == null)
-                {
-                    logger.WriteLine(
-                        "No se encontró el botón de consulta " +
-                        "(frmPrincipal:btnConsultarSinRe); se omite el clic y se continúa " +
-                        "con los resultados disponibles.");
-                }
-                else
-                {
-                    consultarButton.Click();
-                    logger.WriteLine($"Consultando documentos: {GetDocumentTypeLabel(queryType)}");
-                }
-                Thread.Sleep(10000);
-
-                // 5. Procesar tabla
-                IWebElement table = FindElementSafe(driver, By.XPath("//*[@role='grid']"));
-                if (table == null)
-                {
-                    logger.WriteLine("No se encontró la tabla de resultados (posiblemente no hay documentos o cambió el DOM).");
-                    continue;
-                }
-
-                IList<IWebElement> rows = table.FindElements(By.TagName("tr"));
-                logger.WriteLine($"Filas encontradas: {rows.Count}");
-
-                int rowIndex = 0;
-                foreach (IWebElement row in rows)
-                {
-                    IList<IWebElement> cells = row.FindElements(By.TagName("td"));
-                    if (cells.Count < 11)
-                    {
-                        rowIndex++;
+                    if (!SelectDocumentType(driver, queryType, logger))
                         continue;
-                    }
 
-                    string accessKey = cells[3].Text?.Trim() ?? "";
-                    if (string.IsNullOrEmpty(accessKey) || accessKey.Length < 49)
-                    {
-                        logger.WriteLine($"Fila {rowIndex}: clave de acceso inválida '{accessKey}', se omite.");
-                        rowIndex++;
-                        continue;
-                    }
-                    if (!accessKey.Substring(8, 2).Equals(
-                        queryType, StringComparison.OrdinalIgnoreCase))
-                    {
-                        rowIndex++;
-                        continue;
-                    }
-                    SaveGridRecord(cells, accessKey, parameters.DownloadDirectory, logger);
-
-                    // Filtrar por fecha/tipo usando la clave de acceso si el portal no filtró.
-                    if (!ShouldProcess(accessKey, parameters, logger))
-                    {
-                        logger.WriteLine($"Fila {rowIndex}: clave {accessKey} fuera de filtros, se omite.");
-                        skippedCount++;
-                        rowIndex++;
-                        continue;
-                    }
-
-                    logger.WriteLine($"Fila {rowIndex}: procesando clave {accessKey}");
-                    string documentDirectory = GetDocumentTypeDirectory(
-                        parameters.DownloadDirectory, accessKey);
-                    EnsureDirectory(documentDirectory);
-                    driver.ExecuteCdpCommand("Page.setDownloadBehavior", new Dictionary<string, object>
-                    {
-                        { "behavior", "allow" },
-                        { "downloadPath", documentDirectory }
-                    });
-                    logger.WriteLine($"  Carpeta por tipo: {documentDirectory}");
-
-                    // Descargar XML
+                    IWebElement consultarButton = null;
                     try
                     {
-                        bool uploaded = DownloadAndUploadDocument(driver, cells[9], documentDirectory, accessKey + ".xml", "Factura.xml", parameters, logger, isXml: true);
-                        if (uploaded)
-                            uploadedXmlCount++;
-                        else
-                            downloadedXmlCount++;
+                        consultarButton = new WebDriverWait(driver, TimeSpan.FromSeconds(30)).Until(
+                            d => FindElementSafe(d, By.Id(SriSelectors.ConsultButtonId)));
                     }
-                    catch (Exception ex)
+                    catch (WebDriverTimeoutException)
                     {
-                        logger.WriteLine($"Error descargando/subiendo XML {accessKey}: {ex.Message}");
-                        errorCount++;
                     }
 
-                    // Descargar PDF
+                    if (consultarButton == null)
+                    {
+                        logger.WriteLine(
+                            $"No se encontrÃ³ el botÃ³n de consulta ({SriSelectors.ConsultButtonId}); " +
+                            "se continÃºa con los resultados disponibles.");
+                    }
+                    else
+                    {
+                        consultarButton.Click();
+                        logger.WriteLine($"Consultando documentos: {GetDocumentTypeLabel(queryType)}");
+                    }
+
                     try
                     {
-                        bool uploaded = DownloadAndUploadDocument(driver, cells[10], documentDirectory, accessKey + ".pdf", "Factura.pdf", parameters, logger, isXml: false);
-                        if (uploaded)
-                            uploadedPdfCount++;
-                        else
-                            downloadedPdfCount++;
+                        new WebDriverWait(driver, TimeSpan.FromSeconds(20)).Until(
+                            d => FindElementSafe(d, By.XPath(SriSelectors.GridXPath)) != null);
                     }
-                    catch (Exception ex)
+                    catch (WebDriverTimeoutException)
                     {
-                        logger.WriteLine($"Error descargando/subiendo PDF {accessKey}: {ex.Message}");
-                        errorCount++;
+                        logger.WriteLine("No se detectÃ³ la tabla de resultados tras la consulta.");
                     }
 
-                    rowIndex++;
-                }
-                }
+                    IWebElement table = FindElementSafe(driver, By.XPath(SriSelectors.GridXPath));
+                    if (table == null)
+                    {
+                        logger.WriteLine("No se encontrÃ³ la tabla de resultados (posiblemente no hay documentos o cambiÃ³ el DOM).");
+                        continue;
+                    }
+
+                    IList<IWebElement> rows = table.FindElements(By.TagName("tr"));
+                    logger.WriteLine($"Filas encontradas: {rows.Count}");
+                    int rowIndex = 0;
+                    foreach (IWebElement row in rows)
+                    {
+                        IList<IWebElement> cells = row.FindElements(By.TagName("td"));
+                        if (cells.Count < SriSelectors.MinCells)
+                        {
+                            rowIndex++;
+                            continue;
+                        }
+
+                        string accessKey = cells[SriSelectors.ColumnAccessKey].Text?.Trim() ?? "";
+                        if (string.IsNullOrEmpty(accessKey) || accessKey.Length < 49)
+                        {
+                            logger.WriteLine($"Fila {rowIndex}: clave de acceso invÃ¡lida '{accessKey}', se omite.");
+                            rowIndex++;
+                            continue;
+                        }
+
+                        if (!accessKey.Substring(8, 2).Equals(queryType, StringComparison.OrdinalIgnoreCase))
+                        {
+                            rowIndex++;
+                            continue;
+                        }
+
+                        SaveGridRecord(cells, accessKey, parameters.DownloadDirectory, logger);
+
+                        if (!ShouldProcess(accessKey, parameters, logger))
+                        {
+                            logger.WriteLine($"Fila {rowIndex}: clave {accessKey} fuera de filtros, se omite.");
+                            skippedCount++;
+                            rowIndex++;
+                            continue;
+                        }
+
+                        logger.WriteLine($"Fila {rowIndex}: procesando clave {accessKey}");
+                        string documentDirectory = GetDocumentTypeDirectory(parameters.DownloadDirectory, accessKey);
+                        EnsureDirectory(documentDirectory);
+
+                        driver.ExecuteCdpCommand("Page.setDownloadBehavior", new Dictionary<string, object>
+                        {
+                            { "behavior", "allow" },
+                            { "downloadPath", documentDirectory }
+                        });
+                        logger.WriteLine($"  Carpeta por tipo: {documentDirectory}");
+
+                        try
+                        {
+                            bool uploaded = DownloadAndUploadDocument(
+                                driver, cells[SriSelectors.ColumnXml], documentDirectory,
+                                accessKey + ".xml", "Factura.xml", parameters, logger, isXml: true);
+                            if (uploaded)
+                                uploadedXmlCount++;
+                            else
+                                downloadedXmlCount++;
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.WriteLine($"Error descargando/subiendo XML {accessKey}: {ex.Message}");
+                            errorCount++;
+                        }
+
+                        try
+                        {
+                            bool uploaded = DownloadAndUploadDocument(
+                                driver, cells[SriSelectors.ColumnPdf], documentDirectory,
+                                accessKey + ".pdf", accessKey + ".pdf", parameters, logger, isXml: false);
+                            if (uploaded)
+                                uploadedPdfCount++;
+                            else
+                                downloadedPdfCount++;
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.WriteLine($"Error descargando/subiendo PDF {accessKey}: {ex.Message}");
+                            errorCount++;
+                        }
+
+                        rowIndex++;
+                    }
+                } // fin foreach typesToQuery
 
                 logger.WriteLine("======================================================");
-                logger.WriteLine($"Proceso finalizado. XML subidos: {uploadedXmlCount}, PDF subidos: {uploadedPdfCount}, XML descargados: {downloadedXmlCount}, PDF descargados: {downloadedPdfCount}, Omitidos: {skippedCount}, Errores: {errorCount}");
+                logger.WriteLine("Resumen de ejecuciÃ³n");
+                logger.WriteLine($"  XML descargados: {downloadedXmlCount}");
+                logger.WriteLine($"  XML subidos: {uploadedXmlCount}");
+                logger.WriteLine($"  PDF descargados: {downloadedPdfCount}");
+                logger.WriteLine($"  PDF subidos: {uploadedPdfCount}");
+                logger.WriteLine($"  Omitidos: {skippedCount}");
+                logger.WriteLine($"  Errores: {errorCount}");
                 logger.WriteLine("======================================================");
             }
             catch (Exception ex)
             {
-                logger.WriteLine("ERROR CRÍTICO: " + ex.Message);
-                logger.WriteLine(ex.StackTrace);
+                logger.WriteLine("ERROR CRÃTICO: " + ex.Message);
                 try
                 {
-                    driver?.GetScreenshot()?.SaveAsFile(Path.Combine(parameters.DownloadDirectory, "error_screen.png"));
+                    if (!string.IsNullOrWhiteSpace(parameters.DownloadDirectory) && Directory.Exists(parameters.DownloadDirectory) && driver != null)
+                    {
+                        string screenPath = Path.Combine(parameters.DownloadDirectory, "error_screen.png");
+                        var screenshot = ((ITakesScreenshot)driver).GetScreenshot();
+                        screenshot.SaveAsFile(screenPath);
+                        logger.WriteLine("Captura de pantalla guardada: " + screenPath);
+                    }
                 }
-                catch { }
+                catch
+                {
+                }
+                return 1;
             }
             finally
             {
-                try { driver?.Quit(); } catch { }
+                if (driver != null)
+                {
+                    try { driver.Quit(); } catch { }
+                    driver.Dispose();
+                }
             }
-        }
 
+            return 0;
+        }
         private static void PrintUsage()
         {
-            Console.WriteLine("Uso: GENM_WEBSCRAPPER.exe <RUC> <Password> [fechaDesde] [fechaHasta] [tipoDoc] [uploadUrl] [token] [directorioTemporal] [guardarConexion]");
-            Console.WriteLine("  fechaDesde/Hasta: yyyy-MM-dd (opcional)");
-            Console.WriteLine("  tipoDoc: 01-Factura, 03-LiquidaciónCompra, 04-NotaCrédito, 05-NotaDébito, 07-Retención; vacío recorre todos");
-            Console.WriteLine("  uploadUrl: URL del handler receptor (opcional, ej. https://host/u/1.ashx). Si se omite, solo se descargan los archivos.");
-            Console.WriteLine("  token: token de seguridad para el handler receptor (opcional)");
-            Console.WriteLine("  directorioTemporal: carpeta de trabajo (opcional, default %TEMP%\\SriReceived)");
-            Console.WriteLine("  guardarConexion: S para guardar RUC, contraseña, URL y token cifrados para este usuario y máquina; N para no guardar");
+            Console.WriteLine("Uso: GENM_WEBSCRAPPER.exe [opciones]");
+            Console.WriteLine();
+            Console.WriteLine("Opciones nombradas:");
+            Console.WriteLine("  --ruc <valor>             RUC del contribuyente (requerido)");
+            Console.WriteLine("  --password <valor>        ContraseÃ±a del portal SRI (requerido)");
+            Console.WriteLine("  --from <yyyy-MM-dd>       Fecha desde del filtro (opcional)");
+            Console.WriteLine("  --to <yyyy-MM-dd>         Fecha hasta del filtro (opcional)");
+            Console.WriteLine("  --type <codigo>           Tipo de comprobante: 01,03,04,05,07 (opcional)");
+            Console.WriteLine("  --upload-url <url>        Endpoint HTTP receptor (opcional)");
+            Console.WriteLine("  --token <valor>           Token de seguridad (opcional)");
+            Console.WriteLine("  --temp-dir <ruta>         Directorio temporal (default: %TEMP%\\SriReceived)");
+            Console.WriteLine("  --chrome-path <ruta>      Ruta a chrome.exe (opcional)");
+            Console.WriteLine("  --save-connection         Guardar credenciales cifradas (S/N)");
+            Console.WriteLine("  --visible                 Ejecutar Chrome con ventana visible");
+            Console.WriteLine("  --help, -h, /?            Mostrar esta ayuda");
+            Console.WriteLine("  --version, -v             Mostrar versiÃ³n");
+            Console.WriteLine();
+            Console.WriteLine("TambiÃ©n se aceptan argumentos posicionales para compatibilidad:");
+            Console.WriteLine("  RUC Password [desde] [hasta] [tipo] [uploadUrl] [token] [tempDir] [guardarConexion]");
+            Console.WriteLine();
+            Console.WriteLine("Variables de entorno: SRI_RUC, SRI_PASSWORD, SRI_FECHA_DESDE, SRI_FECHA_HASTA,");
+            Console.WriteLine("  SRI_TIPO_DOC, SRI_UPLOAD_URL, SRI_TOKEN, SRI_TEMP_DIR, SRI_VISIBLE, SRI_CHROME_PATH");
         }
-
         private static ScraperParameters ParseArguments(string[] args)
         {
+            var p = new ScraperParameters
+            {
+                DownloadDirectory = Path.Combine(Path.GetTempPath(), "SriReceived")
+            };
+
+            for (int i = 0; i < args.Length; i++)
+            {
+                string arg = args[i];
+                if (arg.StartsWith("--", StringComparison.OrdinalIgnoreCase))
+                {
+                    string name = arg.Substring(2);
+                    string value = (i + 1 < args.Length && !args[i + 1].StartsWith("--"))
+                        ? args[++i] : null;
+
+                    switch (name.ToLowerInvariant())
+                    {
+                        case "ruc": p.Ruc = value; break;
+                        case "password": p.Password = value; break;
+                        case "from": p.FromDate = ParseNullableDate(value); break;
+                        case "to": p.ToDate = ParseNullableDate(value); break;
+                        case "type": p.DocumentType = value; break;
+                        case "upload-url": p.UploadUrl = value?.TrimEnd('/'); break;
+                        case "token": p.Token = value ?? ""; break;
+                        case "temp-dir": p.DownloadDirectory = value; break;
+                        case "chrome-path": p.ChromePath = value; break;
+                        case "save-connection": p.SaveConnection = IsYes(value); break;
+                        case "visible": p.Visible = true; break;
+                    }
+                }
+            }
+
+            string[] positional = args.Where(a => !a.StartsWith("--")).ToArray();
+            int pos = 0;
+            if (string.IsNullOrWhiteSpace(p.Ruc) && pos < positional.Length) p.Ruc = positional[pos++];
+            if (string.IsNullOrWhiteSpace(p.Password) && pos < positional.Length) p.Password = positional[pos++];
+            if (string.IsNullOrWhiteSpace(p.FromDate) && pos < positional.Length) p.FromDate = ParseNullableDate(positional[pos++]);
+            if (string.IsNullOrWhiteSpace(p.ToDate) && pos < positional.Length) p.ToDate = ParseNullableDate(positional[pos++]);
+            if (string.IsNullOrWhiteSpace(p.DocumentType) && pos < positional.Length) p.DocumentType = positional[pos++];
+            if (string.IsNullOrWhiteSpace(p.UploadUrl) && pos < positional.Length) p.UploadUrl = positional[pos++]?.TrimEnd('/');
+            if (string.IsNullOrWhiteSpace(p.Token) && pos < positional.Length) p.Token = positional[pos++];
+            if (string.IsNullOrWhiteSpace(p.DownloadDirectory) && pos < positional.Length) p.DownloadDirectory = positional[pos++];
+            if (pos < positional.Length) p.SaveConnection = IsYes(positional[pos]);
+
             if (args.Length == 0)
             {
                 ScraperParameters saved = TryLoadConnectionData();
-                if (saved != null)
+                if (saved != null && AskUseSavedConnection())
                 {
-                    if (AskUseSavedConnection())
-                        return saved;
-                }
-                else
-                {
-                    Console.WriteLine("Persistencia vacía.");
+                    return saved;
                 }
             }
 
-            string[] values = PromptMissingArguments(args);
-            if (string.IsNullOrWhiteSpace(values[0]) || string.IsNullOrEmpty(values[1]))
+            if (string.IsNullOrWhiteSpace(p.Ruc) || string.IsNullOrWhiteSpace(p.Password))
+            {
+                var values = PromptMissingArguments(new[] { p.Ruc, p.Password });
+                p.Ruc = values[0];
+                p.Password = values[1];
+                if (values.Length > 2 && !string.IsNullOrWhiteSpace(values[2])) p.FromDate = ParseNullableDate(values[2]);
+                if (values.Length > 3 && !string.IsNullOrWhiteSpace(values[3])) p.ToDate = ParseNullableDate(values[3]);
+                if (values.Length > 4 && !string.IsNullOrWhiteSpace(values[4])) p.DocumentType = values[4];
+                if (values.Length > 5 && !string.IsNullOrWhiteSpace(values[5])) p.UploadUrl = values[5].TrimEnd('/');
+                if (values.Length > 6 && !string.IsNullOrWhiteSpace(values[6])) p.Token = values[6];
+                if (values.Length > 7 && !string.IsNullOrWhiteSpace(values[7])) p.DownloadDirectory = values[7];
+                if (values.Length > 8) p.SaveConnection = IsYes(values[8]);
+            }
+
+            if (string.IsNullOrWhiteSpace(p.Ruc) || string.IsNullOrWhiteSpace(p.Password))
                 return null;
-
-            var p = new ScraperParameters
-            {
-                Ruc = values[0],
-                Password = values[1],
-                FromDate = ParseNullableDate(values[2]),
-                ToDate = ParseNullableDate(values[3]),
-                DocumentType = string.IsNullOrWhiteSpace(values[4]) ? null : values[4].Trim(),
-                UploadUrl = string.IsNullOrWhiteSpace(values[5]) ? null : values[5].TrimEnd('/'),
-                Token = string.IsNullOrWhiteSpace(values[6]) ? "" : values[6],
-                SaveConnection = values.Length >= 9 && IsYes(values[8])
-            };
-
-            if (values.Length >= 8 && !string.IsNullOrWhiteSpace(values[7]))
-            {
-                p.DownloadDirectory = values[7];
-            }
-            else
-            {
-                p.DownloadDirectory = Path.Combine(Path.GetTempPath(), "SriReceived");
-            }
 
             return p;
         }
-
         private static string[] PromptMissingArguments(string[] args)
         {
             var values = new List<string>(args);
             string[] prompts =
             {
                 "RUC: ",
-                "Contraseña del SRI: ",
+                "ContraseÃ±a del SRI: ",
                 "Fecha desde (yyyy-MM-dd, Enter para omitir): ",
                 "Fecha hasta (yyyy-MM-dd, Enter para omitir): ",
-                "Tipo (01-Factura, 03-LiquidaciónCompra, 04-NotaCrédito, 05-NotaDébito, 07-Retención; Enter=todos): ",
+                "Tipo (01-Factura, 03-LiquidaciÃ³nCompra, 04-NotaCrÃ©dito, 05-NotaDÃ©bito, 07-RetenciÃ³n; Enter=todos): ",
                 "URL de subida (Enter para solo descargar): ",
                 "Token (Enter si no aplica): "
             };
@@ -392,15 +476,13 @@ namespace GENM_WEBSCRAPPER
                 string defaultDirectory = Path.Combine(Path.GetTempPath(), "SriReceived");
                 Console.Write($"Directorio temporal [{defaultDirectory}]: ");
                 values.Add(Console.ReadLine() ?? "");
-                Console.Write("¿Desea guardar cifrados los datos de conexión en esta máquina? (S/N): ");
+                Console.Write("Â¿Desea guardar cifrados los datos de conexiÃ³n en esta mÃ¡quina? (S/N): ");
                 values.Add(Console.ReadLine() ?? "");
             }
             else if (values.Count < 9)
             {
-                // Reservar la posición del directorio cuando no vino por CLI.
-                if (values.Count < 8)
-                    values.Add("");
-                Console.Write("¿Desea guardar cifrados los datos de conexión en esta máquina? (S/N): ");
+                if (values.Count < 8) values.Add("");
+                Console.Write("Â¿Desea guardar cifrados los datos de conexiÃ³n en esta mÃ¡quina? (S/N): ");
                 values.Add(Console.ReadLine() ?? "");
             }
             return values.ToArray();
@@ -417,17 +499,14 @@ namespace GENM_WEBSCRAPPER
             while (true)
             {
                 Console.Write(
-                    "Se encontraron datos de conexión cifrados. " +
-                    "¿Qué desea hacer? (S=reutilizarlos / N=ingresar todo nuevamente): ");
+                    "Se encontraron datos de conexiÃ³n cifrados. " +
+                    "Â¿QuÃ© desea hacer? (S=reutilizarlos / N=ingresar todo nuevamente): ");
                 string answer = (Console.ReadLine() ?? "").Trim();
-                if (answer.Equals("S", StringComparison.OrdinalIgnoreCase))
-                    return true;
-                if (answer.Equals("N", StringComparison.OrdinalIgnoreCase))
-                    return false;
-                Console.WriteLine("Respuesta no válida. Escriba S o N.");
+                if (answer.Equals("S", StringComparison.OrdinalIgnoreCase)) return true;
+                if (answer.Equals("N", StringComparison.OrdinalIgnoreCase)) return false;
+                Console.WriteLine("Respuesta no vÃ¡lida. Escriba S o N.");
             }
         }
-
         private static string ConnectionDataPath
         {
             get
@@ -451,7 +530,6 @@ namespace GENM_WEBSCRAPPER
                 return sha256.ComputeHash(Encoding.UTF8.GetBytes(
                     "GENM_WEBSCRAPPER|" + machineGuid));
         }
-
         private static void SaveConnectionData(ScraperParameters parameters)
         {
             byte[] plain;
@@ -483,17 +561,11 @@ namespace GENM_WEBSCRAPPER
                         directory, "connection." + Guid.NewGuid().ToString("N") + ".tmp");
                     try
                     {
-                        try
-                        {
-                            acquired = mutex.WaitOne(TimeSpan.FromSeconds(15));
-                        }
-                        catch (AbandonedMutexException)
-                        {
-                            acquired = true;
-                        }
+                        try { acquired = mutex.WaitOne(TimeSpan.FromSeconds(15)); }
+                        catch (AbandonedMutexException) { acquired = true; }
                         if (!acquired)
-                            throw new TimeoutException("Otra instancia está actualizando la conexión.");
-                        File.WriteAllBytes(temporaryPath, encrypted);
+                            throw new TimeoutException("Otra instancia estÃ¡ escribiendo la conexiÃ³n.");
+                        File.WriteAllText(temporaryPath, Convert.ToBase64String(encrypted), Encoding.UTF8);
                         if (File.Exists(ConnectionDataPath))
                             File.Replace(temporaryPath, ConnectionDataPath, null);
                         else
@@ -501,93 +573,66 @@ namespace GENM_WEBSCRAPPER
                     }
                     finally
                     {
-                        if (File.Exists(temporaryPath))
-                            File.Delete(temporaryPath);
-                        if (acquired)
-                            mutex.ReleaseMutex();
+                        if (acquired) mutex.ReleaseMutex();
                     }
                 }
             }
             finally
             {
-                Array.Clear(plain, 0, plain.Length);
+                if (plain != null) Array.Clear(plain, 0, plain.Length);
             }
         }
-
         private static ScraperParameters TryLoadConnectionData()
         {
-            byte[] plain = null;
-            try
+            byte[] encrypted = null;
+            using (var mutex = new Mutex(false, @"Local\GENM_WEBSCRAPPER_CONNECTION_CSHARP"))
             {
-                byte[] encrypted;
-                using (var mutex = new Mutex(false, @"Local\GENM_WEBSCRAPPER_CONNECTION_CSHARP"))
+                bool acquired = false;
+                try
                 {
-                    bool acquired = false;
-                    try
-                    {
-                        try
-                        {
-                            acquired = mutex.WaitOne(TimeSpan.FromSeconds(15));
-                        }
-                        catch (AbandonedMutexException)
-                        {
-                            acquired = true;
-                        }
-                        if (!acquired)
-                            throw new TimeoutException("Otra instancia está actualizando la conexión.");
-                        if (!File.Exists(ConnectionDataPath))
-                            return null;
-                        encrypted = File.ReadAllBytes(ConnectionDataPath);
-                    }
-                    finally
-                    {
-                        if (acquired)
-                            mutex.ReleaseMutex();
-                    }
+                    try { acquired = mutex.WaitOne(TimeSpan.FromSeconds(15)); }
+                    catch (AbandonedMutexException) { acquired = true; }
+                    if (!acquired)
+                        throw new TimeoutException("Otra instancia estÃ¡ leyendo la conexiÃ³n.");
+                    if (!File.Exists(ConnectionDataPath)) return null;
+                    encrypted = Convert.FromBase64String(File.ReadAllText(ConnectionDataPath));
                 }
-                plain = ProtectedData.Unprotect(
-                    encrypted, GetMachineEntropy(),
-                    DataProtectionScope.CurrentUser);
-                using (var stream = new MemoryStream(plain))
-                using (var reader = new BinaryReader(stream, Encoding.UTF8))
+                finally
                 {
-                    string ruc = reader.ReadString();
-                    string password = reader.ReadString();
-                    string uploadUrl = reader.ReadString();
-                    string token = reader.ReadString();
-                    // Los cuatro campos siguientes no existen en persistencias
-                    // anteriores; conservar valores predeterminados al migrarlas.
-                    string fromDate = stream.Position < stream.Length ? reader.ReadString() : null;
-                    string toDate = stream.Position < stream.Length ? reader.ReadString() : null;
-                    string documentType = stream.Position < stream.Length ? reader.ReadString() : null;
-                    string downloadDirectory = stream.Position < stream.Length
-                        ? reader.ReadString()
-                        : Path.Combine(Path.GetTempPath(), "SriReceived");
-                    return new ScraperParameters
-                    {
-                        Ruc = ruc,
-                        Password = password,
-                        UploadUrl = EmptyToNull(uploadUrl),
-                        Token = token,
-                        FromDate = EmptyToNull(fromDate),
-                        ToDate = EmptyToNull(toDate),
-                        DocumentType = EmptyToNull(documentType),
-                        DownloadDirectory = string.IsNullOrWhiteSpace(downloadDirectory)
-                            ? Path.Combine(Path.GetTempPath(), "SriReceived")
-                            : downloadDirectory,
-                        SaveConnection = false
-                    };
+                    if (acquired) mutex.ReleaseMutex();
                 }
             }
-            catch (Exception ex)
+
+            byte[] plain = ProtectedData.Unprotect(
+                encrypted, GetMachineEntropy(), DataProtectionScope.CurrentUser);
+            using (var stream = new MemoryStream(plain))
+            using (var reader = new BinaryReader(stream, Encoding.UTF8))
             {
-                Console.WriteLine("No se pudieron leer los datos de conexión guardados: " + ex.Message);
-                return null;
-            }
-            finally
-            {
-                if (plain != null)
-                    Array.Clear(plain, 0, plain.Length);
+                string ruc = reader.ReadString();
+                string password = reader.ReadString();
+                string uploadUrl = reader.ReadString();
+                string token = reader.ReadString();
+                string fromDate = stream.Position < stream.Length ? reader.ReadString() : null;
+                string toDate = stream.Position < stream.Length ? reader.ReadString() : null;
+                string documentType = stream.Position < stream.Length ? reader.ReadString() : null;
+                string downloadDirectory = stream.Position < stream.Length
+                    ? reader.ReadString()
+                    : Path.Combine(Path.GetTempPath(), "SriReceived");
+
+                return new ScraperParameters
+                {
+                    Ruc = ruc,
+                    Password = password,
+                    UploadUrl = EmptyToNull(uploadUrl),
+                    Token = token,
+                    FromDate = EmptyToNull(fromDate),
+                    ToDate = EmptyToNull(toDate),
+                    DocumentType = EmptyToNull(documentType),
+                    DownloadDirectory = string.IsNullOrWhiteSpace(downloadDirectory)
+                        ? Path.Combine(Path.GetTempPath(), "SriReceived")
+                        : downloadDirectory,
+                    SaveConnection = false
+                };
             }
         }
 
@@ -595,7 +640,6 @@ namespace GENM_WEBSCRAPPER
         {
             return string.IsNullOrWhiteSpace(value) ? null : value;
         }
-
         private static string ReadSecret()
         {
             var value = new StringBuilder();
@@ -604,8 +648,7 @@ namespace GENM_WEBSCRAPPER
             {
                 if (key.Key == ConsoleKey.Backspace)
                 {
-                    if (value.Length > 0)
-                        value.Length--;
+                    if (value.Length > 0) value.Length--;
                 }
                 else if (!char.IsControl(key.KeyChar))
                 {
@@ -618,9 +661,9 @@ namespace GENM_WEBSCRAPPER
 
         private static string ParseNullableDate(string value)
         {
-            if (string.IsNullOrWhiteSpace(value))
-                return null;
-            if (DateTime.TryParseExact(value.Trim(), "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out _))
+            if (string.IsNullOrWhiteSpace(value)) return null;
+            if (DateTime.TryParseExact(value.Trim(), "yyyy-MM-dd",
+                CultureInfo.InvariantCulture, DateTimeStyles.None, out _))
                 return value.Trim();
             return null;
         }
@@ -631,11 +674,11 @@ namespace GENM_WEBSCRAPPER
                 Directory.CreateDirectory(path);
         }
 
-        private static IWebElement FindElementSafe(ISearchContext driver, By by)
+        private static IWebElement FindElementSafe(ISearchContext context, By by)
         {
             try
             {
-                return driver.FindElement(by);
+                return context.FindElement(by);
             }
             catch (NoSuchElementException)
             {
@@ -646,8 +689,8 @@ namespace GENM_WEBSCRAPPER
         private static void WaitForLogin(ChromeDriver driver, SimpleLogger logger, TimeSpan timeout)
         {
             logger.WriteLine(
-                "Esperando que finalice el inicio de sesión. Si aparece un CAPTCHA, " +
-                "resuélvalo manualmente en Chrome (máximo 3 minutos).");
+                "Esperando que finalice el inicio de sesiÃ³n. Si aparece un CAPTCHA, " +
+                "resuÃ©lvalo manualmente en Chrome (mÃ¡ximo 3 minutos).");
             DateTime deadline = DateTime.UtcNow.Add(timeout);
             while (DateTime.UtcNow < deadline)
             {
@@ -655,70 +698,109 @@ namespace GENM_WEBSCRAPPER
                 string currentUrl = (driver.Url ?? "").ToLowerInvariant();
                 if (loginUser == null && !currentUrl.Contains("/auth/realms/"))
                 {
-                    logger.WriteLine("Inicio de sesión confirmado.");
+                    logger.WriteLine("Inicio de sesiÃ³n confirmado.");
                     return;
                 }
                 Thread.Sleep(1000);
             }
             throw new Exception(
-                "El inicio de sesión no se completó. Revise las credenciales, mensajes " +
+                "El inicio de sesiÃ³n no se completÃ³. Revise las credenciales, mensajes " +
                 "del portal y resuelva manualmente el CAPTCHA si aparece.");
         }
-
         private static void ApplyFilters(ChromeDriver driver, ScraperParameters parameters, SimpleLogger logger)
         {
-            // Seleccionar "todos" en el dropdown de días (comportamiento original).
             try
             {
-                var dayDropdown = new SelectElement(driver.FindElement(By.Id("frmPrincipal:dia")));
+                var dayDropdown = new SelectElement(driver.FindElement(By.Id(SriSelectors.DayDropdownId)));
                 dayDropdown.SelectByIndex(0);
-                logger.WriteLine("Filtro de día: todos.");
+                logger.WriteLine("Filtro de dÃ­a: todos.");
                 new WebDriverWait(driver, TimeSpan.FromSeconds(30)).Until(
-                    d => FindElementSafe(d, By.Id("frmPrincipal:cmbTipoComprobante")) != null);
+                    d => FindElementSafe(d, By.Id(SriSelectors.DocumentTypeDropdownId)) != null);
             }
             catch (Exception ex)
             {
-                logger.WriteLine("No se pudo aplicar filtro de día: " + ex.Message);
+                logger.WriteLine("No se pudo aplicar filtro de dÃ­a: " + ex.Message);
             }
 
-            // Intentar aplicar fechas y tipo si los controles existen.
-            SetInputValueSafe(driver, "frmPrincipal:fechaDesde", parameters.FromDate, logger);
-            SetInputValueSafe(driver, "frmPrincipal:fechaHasta", parameters.ToDate, logger);
+            SetInputValueSafe(driver, SriSelectors.DateFromInputId, parameters.FromDate, logger);
+            SetInputValueSafe(driver, SriSelectors.DateToInputId, parameters.ToDate, logger);
 
-            // El tipo se selecciona en el ciclo de consultas usando el texto
-            // visible, porque los value del portal no son los códigos SRI.
+            if (!string.IsNullOrWhiteSpace(parameters.DocumentType))
+            {
+                try
+                {
+                    var typeDropdown = new SelectElement(
+                        driver.FindElement(By.Id(SriSelectors.DocumentTypeDropdownId)));
+                    typeDropdown.SelectByValue(GetDocumentTypeSelectorValue(parameters.DocumentType));
+                    logger.WriteLine($"Filtro tipo: {parameters.DocumentType}");
+                }
+                catch (Exception ex)
+                {
+                    logger.WriteLine("No se pudo aplicar filtro de tipo: " + ex.Message);
+                }
+            }
         }
 
-        private static bool SelectDocumentType(ChromeDriver driver, string code, SimpleLogger logger)
+        private static void SetInputValueSafe(IWebDriver driver, string id, string value, SimpleLogger logger)
+        {
+            if (string.IsNullOrEmpty(value)) return;
+            try
+            {
+                var element = new WebDriverWait(driver, TimeSpan.FromSeconds(20)).Until(
+                    d => FindElementSafe(d, By.Id(id)));
+                element.Clear();
+                element.SendKeys(value);
+                logger.WriteLine($"Filtro {id}: {value}");
+            }
+            catch (Exception ex)
+            {
+                logger.WriteLine($"No se pudo aplicar filtro {id}: {ex.Message}");
+            }
+        }
+
+        private static bool ShouldProcess(string accessKey, ScraperParameters parameters, SimpleLogger logger)
         {
             try
             {
-                IWebElement element = new WebDriverWait(
-                    driver, TimeSpan.FromSeconds(30)).Until(
-                        d => FindElementSafe(d, By.Id("frmPrincipal:cmbTipoComprobante")));
-                var dropdown = new SelectElement(element);
-                dropdown.SelectByValue(GetDocumentTypeSelectorValue(code));
-                logger.WriteLine("Filtro tipo comprobante: " + GetDocumentTypeLabel(code));
+                string datePart = accessKey.Substring(0, 8);
+                DateTime docDate = DateTime.ParseExact(datePart, "ddMMyyyy",
+                    CultureInfo.InvariantCulture);
+
+                if (parameters.FromDate != null)
+                {
+                    DateTime from = DateTime.ParseExact(parameters.FromDate, "yyyy-MM-dd",
+                        CultureInfo.InvariantCulture);
+                    if (docDate < from) return false;
+                }
+                if (parameters.ToDate != null)
+                {
+                    DateTime to = DateTime.ParseExact(parameters.ToDate, "yyyy-MM-dd",
+                        CultureInfo.InvariantCulture);
+                    if (docDate > to) return false;
+                }
+                if (!string.IsNullOrEmpty(parameters.DocumentType))
+                {
+                    string docType = accessKey.Substring(8, 2);
+                    if (!docType.Equals(parameters.DocumentType, StringComparison.OrdinalIgnoreCase))
+                        return false;
+                }
                 return true;
             }
-            catch (WebDriverTimeoutException)
+            catch (Exception ex)
             {
-                logger.WriteLine(
-                    "No apareció el selector de tipo para " +
-                    GetDocumentTypeLabel(code) + "; se omite esta consulta.");
-                return false;
+                logger.WriteLine("Error parseando clave de acceso para filtrado: " + ex.Message);
+                return true;
             }
         }
-
         private static string GetDocumentTypeLabel(string code)
         {
             switch (code)
             {
                 case "01": return "01-Factura";
-                case "03": return "03-LiquidaciónCompra";
-                case "04": return "04-NotaCrédito";
-                case "05": return "05-NotaDébito";
-                case "07": return "07-Retención";
+                case "03": return "03-LiquidaciÃ³nCompra";
+                case "04": return "04-NotaCrÃ©dito";
+                case "05": return "05-NotaDÃ©bito";
+                case "07": return "07-RetenciÃ³n";
                 default: return code + "-Otro";
             }
         }
@@ -736,61 +818,20 @@ namespace GENM_WEBSCRAPPER
             }
         }
 
-        private static void SetInputValueSafe(IWebDriver driver, string id, string value, SimpleLogger logger)
-        {
-            if (string.IsNullOrEmpty(value))
-                return;
-
-            try
-            {
-                var element = new WebDriverWait(
-                    driver, TimeSpan.FromSeconds(20)).Until(
-                        d => FindElementSafe(d, By.Id(id)));
-                element.Clear();
-                element.SendKeys(value);
-                logger.WriteLine($"Filtro {id}: {value}");
-            }
-            catch (Exception ex)
-            {
-                logger.WriteLine($"No se pudo aplicar filtro {id}: {ex.Message}");
-            }
-        }
-
-        private static bool ShouldProcess(string accessKey, ScraperParameters parameters, SimpleLogger logger)
+        private static bool SelectDocumentType(ChromeDriver driver, string typeCode, SimpleLogger logger)
         {
             try
             {
-                // Posiciones de la clave de acceso SRI (0-based):
-                // 0-7: fecha de emisión (DDMMAAAA)
-                // 8-9: tipo de comprobante
-                // ...
-                string datePart = accessKey.Substring(0, 8);
-                DateTime docDate = DateTime.ParseExact(datePart, "ddMMyyyy", System.Globalization.CultureInfo.InvariantCulture);
-
-                if (parameters.FromDate != null)
-                {
-                    DateTime from = DateTime.ParseExact(parameters.FromDate, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
-                    if (docDate < from)
-                        return false;
-                }
-                if (parameters.ToDate != null)
-                {
-                    DateTime to = DateTime.ParseExact(parameters.ToDate, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
-                    if (docDate > to)
-                        return false;
-                }
-                if (!string.IsNullOrEmpty(parameters.DocumentType))
-                {
-                    string docType = accessKey.Substring(8, 2);
-                    if (!docType.Equals(parameters.DocumentType, StringComparison.OrdinalIgnoreCase))
-                        return false;
-                }
+                var dropdown = new SelectElement(
+                    driver.FindElement(By.Id(SriSelectors.DocumentTypeDropdownId)));
+                dropdown.SelectByValue(GetDocumentTypeSelectorValue(typeCode));
+                logger.WriteLine($"Tipo seleccionado: {GetDocumentTypeLabel(typeCode)}");
                 return true;
             }
             catch (Exception ex)
             {
-                logger.WriteLine("Error parseando clave de acceso para filtrado: " + ex.Message);
-                return true; // si no se puede validar, procesar.
+                logger.WriteLine($"No se pudo seleccionar tipo {typeCode}: " + ex.Message);
+                return false;
             }
         }
 
@@ -832,6 +873,7 @@ namespace GENM_WEBSCRAPPER
                 fields,
                 raw_fields = rawFields
             };
+
             string recordDirectory = GetDocumentTypeDirectory(downloadDirectory, accessKey);
             EnsureDirectory(recordDirectory);
             string path = Path.Combine(recordDirectory, accessKey + ".json");
@@ -840,21 +882,13 @@ namespace GENM_WEBSCRAPPER
                 bool acquired = false;
                 try
                 {
-                    try
-                    {
-                        acquired = mutex.WaitOne(TimeSpan.FromSeconds(15));
-                    }
-                    catch (AbandonedMutexException)
-                    {
-                        acquired = true;
-                    }
+                    try { acquired = mutex.WaitOne(TimeSpan.FromSeconds(15)); }
+                    catch (AbandonedMutexException) { acquired = true; }
                     if (!acquired)
-                        throw new TimeoutException("Otra instancia está escribiendo el registro del grid.");
+                        throw new TimeoutException("Otra instancia estÃ¡ escribiendo el registro del grid.");
                     string temporaryPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                    File.WriteAllText(
-                        temporaryPath,
-                        JsonConvert.SerializeObject(record, Formatting.Indented),
-                        Encoding.UTF8);
+                    File.WriteAllText(temporaryPath,
+                        JsonConvert.SerializeObject(record, Formatting.Indented), Encoding.UTF8);
                     if (File.Exists(path))
                         File.Replace(temporaryPath, path, null);
                     else
@@ -862,20 +896,16 @@ namespace GENM_WEBSCRAPPER
                 }
                 finally
                 {
-                    if (acquired)
-                        mutex.ReleaseMutex();
+                    if (acquired) mutex.ReleaseMutex();
                 }
             }
-            logger.WriteLine($"  JSON de fila guardado: {path}");
+            logger.WriteLine("  JSON de fila guardado: " + path);
         }
-
         private static string GetGridCellValue(IList<IWebElement> cells, int index)
         {
-            if (index >= cells.Count)
-                return "";
+            if (index >= cells.Count) return "";
             string value = (cells[index].Text ?? "").Trim();
-            if (!string.IsNullOrEmpty(value))
-                return value;
+            if (!string.IsNullOrEmpty(value)) return value;
             try
             {
                 IWebElement link = cells[index].FindElement(By.TagName("a"));
@@ -896,103 +926,87 @@ namespace GENM_WEBSCRAPPER
             switch (code)
             {
                 case "01": name = "Factura"; break;
-                case "03": name = "LiquidaciónCompra"; break;
-                case "04": name = "NotaCrédito"; break;
-                case "05": name = "NotaDébito"; break;
-                case "07": name = "Retención"; break;
+                case "03": name = "LiquidaciÃ³nCompra"; break;
+                case "04": name = "NotaCrÃ©dito"; break;
+                case "05": name = "NotaDÃ©bito"; break;
+                case "07": name = "RetenciÃ³n"; break;
                 default: name = "Otro"; break;
             }
             return Path.Combine(baseDirectory, code + "-" + name);
         }
 
-        private static bool DownloadAndUploadDocument(IWebDriver driver, IWebElement cell, string downloadDirectory, string targetFileName, string expectedDownloadName, ScraperParameters parameters, SimpleLogger logger, bool isXml)
+        private static bool DownloadAndUploadDocument(IWebDriver driver, IWebElement cell,
+            string downloadDirectory, string targetFileName, string expectedDownloadName,
+            ScraperParameters parameters, SimpleLogger logger, bool isXml)
         {
             string targetPath = Path.Combine(downloadDirectory, targetFileName);
             if (File.Exists(targetPath))
             {
                 logger.WriteLine($"  {targetFileName} ya existe localmente.");
-            }
-            else
-            {
-                string genericPath = Path.Combine(downloadDirectory, expectedDownloadName);
-                if (File.Exists(genericPath))
-                    File.Delete(genericPath);
-                foreach (string partial in Directory.GetFiles(downloadDirectory, "*.crdownload"))
-                    File.Delete(partial);
-
-                var existingFiles = new HashSet<string>(
-                    Directory.GetFiles(downloadDirectory), StringComparer.OrdinalIgnoreCase);
-
-                var link = cell.FindElement(By.TagName("a"));
-                link.Click();
-                logger.WriteLine($"  Descargando {expectedDownloadName}...");
-
-                string downloadedPath = WaitForDownload(
-                    downloadDirectory, expectedDownloadName, existingFiles, 60000);
-
-                if (File.Exists(targetPath))
-                    File.Delete(targetPath);
-                File.Move(downloadedPath, targetPath);
-            }
-
-            // Subir al endpoint solo si se configuró URL de destino.
-            if (string.IsNullOrWhiteSpace(parameters.UploadUrl))
-            {
-                logger.WriteLine($"  {targetFileName} no se sube: no se configuró URL de destino.");
                 return false;
             }
 
-            if (isXml)
-            {
-                string xml = File.ReadAllText(targetPath, Encoding.UTF8);
-                UploadXml(parameters.UploadUrl, parameters.Token, targetFileName, xml, logger);
-            }
-            else
-            {
-                byte[] pdf = File.ReadAllBytes(targetPath);
-                UploadPdf(parameters.UploadUrl, parameters.Token, targetFileName, pdf, logger);
-            }
-            return true;
-        }
+            string genericPath = Path.Combine(downloadDirectory, expectedDownloadName);
+            if (File.Exists(genericPath)) File.Delete(genericPath);
+            foreach (string partial in Directory.GetFiles(downloadDirectory, "*.crdownload"))
+                File.Delete(partial);
 
+            var existingFiles = new HashSet<string>(
+                Directory.GetFiles(downloadDirectory), StringComparer.OrdinalIgnoreCase);
+
+            var link = cell.FindElement(By.TagName("a"));
+            link.Click();
+            logger.WriteLine($"  Descargando {expectedDownloadName}...");
+
+            string downloadedPath = WaitForDownload(
+                downloadDirectory, expectedDownloadName, existingFiles, 60000);
+
+            if (downloadedPath == null)
+                throw new Exception("No se descargÃ³ el archivo " + expectedDownloadName);
+
+            string finalPath = Path.Combine(downloadDirectory, targetFileName);
+            if (File.Exists(finalPath)) File.Delete(finalPath);
+            File.Move(downloadedPath, finalPath);
+            logger.WriteLine($"  Archivo guardado: {targetFileName}");
+
+            if (!string.IsNullOrWhiteSpace(parameters.UploadUrl))
+            {
+                if (isXml)
+                {
+                    string xmlContent = File.ReadAllText(finalPath, Encoding.UTF8);
+                    UploadXml(parameters.UploadUrl, parameters.Token, targetFileName, xmlContent, logger);
+                }
+                else
+                {
+                    byte[] pdfBytes = File.ReadAllBytes(finalPath);
+                    UploadPdf(parameters.UploadUrl, parameters.Token, targetFileName, pdfBytes, logger);
+                }
+                return true;
+            }
+            return false;
+        }
         private static string WaitForDownload(string directory, string expectedName,
-            HashSet<string> existingFiles, int timeoutMilliseconds)
+            HashSet<string> existingFiles, int timeoutMs)
         {
-            DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
-            string expectedPath = Path.Combine(directory, expectedName);
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
             while (DateTime.UtcNow < deadline)
             {
-                string[] partials = Directory.GetFiles(directory, "*.crdownload");
-                if (File.Exists(expectedPath) && partials.Length == 0)
-                    return expectedPath;
-
-                string newest = null;
-                DateTime newestTime = DateTime.MinValue;
+                Thread.Sleep(500);
                 foreach (string file in Directory.GetFiles(directory))
                 {
                     if (existingFiles.Contains(file) ||
                         file.EndsWith(".crdownload", StringComparison.OrdinalIgnoreCase))
                         continue;
-                    DateTime modified = File.GetLastWriteTimeUtc(file);
-                    if (modified > newestTime)
-                    {
-                        newest = file;
-                        newestTime = modified;
-                    }
+                    string fileName = Path.GetFileName(file);
+                    if (fileName.Equals(expectedName, StringComparison.OrdinalIgnoreCase))
+                        return file;
                 }
-                if (newest != null && partials.Length == 0)
-                    return newest;
-                Thread.Sleep(500);
             }
-
-            string pending = string.Join(", ", Directory.GetFiles(directory, "*.crdownload"));
-            string detail = string.IsNullOrEmpty(pending)
-                ? ""
-                : " Descarga pendiente o bloqueada: " + pending + ".";
-            throw new Exception($"No se descargó el archivo {expectedName}.{detail}");
+            return null;
         }
 
-        private static void UploadXml(string uploadUrl, string token, string fileName, string xmlContent, SimpleLogger logger)
+        private static void UploadXml(string uploadUrl, string token, string fileName,
+            string xmlContent, SimpleLogger logger)
         {
             string url = $"{uploadUrl}?x=facsri&fn={Uri.EscapeDataString(fileName)}&t={Uri.EscapeDataString(token)}";
             using (var wc = new WebClient())
@@ -1001,10 +1015,11 @@ namespace GENM_WEBSCRAPPER
                 wc.Headers[HttpRequestHeader.ContentType] = "application/json";
                 wc.UploadString(url, xmlContent);
             }
-            logger.WriteLine($"  XML subido: {fileName}");
+            logger.WriteLine("  XML subido: " + fileName);
         }
 
-        private static void UploadPdf(string uploadUrl, string token, string fileName, byte[] pdfBytes, SimpleLogger logger)
+        private static void UploadPdf(string uploadUrl, string token, string fileName,
+            byte[] pdfBytes, SimpleLogger logger)
         {
             string url = $"{uploadUrl}?x=facsripdf&fn={Uri.EscapeDataString(fileName)}&t={Uri.EscapeDataString(token)}";
             using (var wc = new WebClient())
@@ -1012,7 +1027,7 @@ namespace GENM_WEBSCRAPPER
                 wc.Headers[HttpRequestHeader.ContentType] = "multipart/form-data";
                 wc.UploadData(url, pdfBytes);
             }
-            logger.WriteLine($"  PDF subido: {fileName}");
+            logger.WriteLine("  PDF subido: " + fileName);
         }
 
         private class ScraperParameters
@@ -1025,16 +1040,15 @@ namespace GENM_WEBSCRAPPER
             public string UploadUrl { get; set; }
             public string Token { get; set; }
             public string DownloadDirectory { get; set; }
+            public string ChromePath { get; set; }
+            public bool Visible { get; set; }
             public bool SaveConnection { get; set; }
         }
 
         private class SimpleLogger
         {
             private readonly string _filePath;
-            public SimpleLogger(string filePath)
-            {
-                _filePath = filePath;
-            }
+            public SimpleLogger(string filePath) { _filePath = filePath; }
 
             public void WriteLine(string message)
             {
@@ -1046,6 +1060,16 @@ namespace GENM_WEBSCRAPPER
                 }
                 catch { }
             }
+        }
+
+        private static bool ContainsFlag(string[] args, params string[] flags)
+        {
+            foreach (string flag in flags)
+            {
+                if (args.Any(a => a.Equals(flag, StringComparison.OrdinalIgnoreCase)))
+                    return true;
+            }
+            return false;
         }
     }
 }
